@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delivery Time Predictor</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #0056b3;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="number"],
+        input[type="datetime-local"],
+        select {
+            width: calc(100% - 22px);
+            padding: 10px;
+            margin-bottom: 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        #predictionResult {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e9ecef;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            text-align: center;
+            font-size: 1.1em;
+            font-weight: bold;
+        }
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Delivery Time Predictor</h1>
+        <form id="predictionForm">
+            <label for="created_at">Order Created At:</label>
+            <input type="datetime-local" id="created_at" name="created_at" required>
+
+            <label for="market_id">Market ID:</label>
+            <input type="number" id="market_id" name="market_id" value="1" step="1" required>
+
+            <label for="store_primary_category">Store Primary Category:</label>
+            <select id="store_primary_category" name="store_primary_category" required>
+                <option value="Unknown">Unknown</option>
+                <option value="fast food">Fast Food</option>
+                <option value="indian">Indian</option>
+                <option value="thai">Thai</option>
+                <option value="pizza">Pizza</option>
+                <option value="japanese">Japanese</option>
+                <option value="chinese">Chinese</option>
+                <option value="american">American</option>
+                <option value="mexican">Mexican</option>
+                <!-- Add more categories as per your training data -->
+            </select>
+
+            <label for="order_protocol">Order Protocol:</label>
+            <input type="number" id="order_protocol" name="order_protocol" value="1" step="1" required>
+
+            <label for="total_items">Total Items:</label>
+            <input type="number" id="total_items" name="total_items" value="2" step="1" required>
+
+            <label for="subtotal">Subtotal:</label>
+            <input type="number" id="subtotal" name="subtotal" value="2500" step="1" required>
+
+            <label for="num_distinct_items">Number of Distinct Items:</label>
+            <input type="number" id="num_distinct_items" name="num_distinct_items" value="2" step="1" required>
+
+            <label for="min_item_price">Minimum Item Price:</label>
+            <input type="number" id="min_item_price" name="min_item_price" value="500" step="1" required>
+
+            <label for="max_item_price">Maximum Item Price:</label>
+            <input type="number" id="max_item_price" name="max_item_price" value="2000" step="1" required>
+
+            <label for="total_onshift_partners">Total Onshift Partners:</label>
+            <input type="number" id="total_onshift_partners" name="total_onshift_partners" value="5" step="1" required>
+
+            <label for="total_busy_partners">Total Busy Partners:</label>
+            <input type="number" id="total_busy_partners" name="total_busy_partners" value="3" step="1" required>
+
+            <label for="total_outstanding_orders">Total Outstanding Orders:</label>
+            <input type="number" id="total_outstanding_orders" name="total_outstanding_orders" value="2" step="1" required>
+
+            <button type="submit">Get Prediction</button>
+        </form>
+        <div id="predictionResult"></div>
+    </div>
+
+    <script>
+        document.getElementById('predictionForm').addEventListener('submit', async function(event) {
+            event.preventDefault();
+
+            const form = event.target;
+            const formData = new FormData(form);
+            const data = {};
+            for (let [key, value] of formData.entries()) {
+                // Convert numerical inputs to numbers, leave others as strings
+                if (!isNaN(value) && value !== '') {
+                    data[key] = parseFloat(value);
+                } else {
+                    data[key] = value;
+                }
+            }
+            
+            // Temporary fix for datetime-local format to match pandas.to_datetime
+            if (data.created_at) {
+                data.created_at = data.created_at.replace('T', ' ');
+            }
+
+            const resultDiv = document.getElementById('predictionResult');
+            resultDiv.innerHTML = 'Predicting...';
+            resultDiv.classList.remove('error');
+
+            try {
+                // Important: Replace with the actual URL of your deployed Flask API
+                // If running locally, it might be 'http://127.0.0.1:5000/predict' or 'http://localhost:5000/predict'
+                const response = await fetch('http://127.0.0.1:5000/predict', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(data)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+                }
+
+                const result = await response.json();
+                if (result.predicted_delivery_time_minutes) {
+                    resultDiv.innerHTML = `Predicted Delivery Time: <strong>${result.predicted_delivery_time_minutes.toFixed(2)} minutes</strong>`;
+                } else {
+                    resultDiv.innerHTML = 'Prediction failed: No result returned.';
+                    resultDiv.classList.add('error');
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `Error: ${error.message}. Make sure your Flask app is running!`;
+                resultDiv.classList.add('error');
+                console.error('Prediction error:', error);
+            }
+        });
+    </script>
+</body>
+</html>
