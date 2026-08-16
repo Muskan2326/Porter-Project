@@ -1,131 +1,185 @@
-import pandas as pd
+import os
+import zipfile
+import urllib.request
+import joblib
 import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras import models
-import  joblib
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
 
-# Define the URL to the dataset
-dataset_url = "https://d2beiqkhq929f0.cloudfront.net/public_assets/assets/000/015/039/original/dataset.csv.zip"
+# Set random seeds
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-# Load the dataset into a pandas DataFrame
-df = pd.read_csv(dataset_url, compression='zip')
+# ==========================================
+# 1. NEURAL NETWORK ARCHITECTURE
+# ==========================================
+class DeliveryTimePredictor(nn.Module):
+    def __init__(self, input_dim):
+        super(DeliveryTimePredictor, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            
+            nn.Linear(32, 1)
+        )
+        self._init_weights()
 
-# The first 5 rows of the DataFrame
-df.head()
-# DataFrame information to check data types and non-null counts
-df.info()
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
 
-# Check for null values in each column
-df.isnull().sum()
-# Convert timestamp columns to datetime objects
-df['created_at'] = pd.to_datetime(df['created_at'])
-df['actual_delivery_time'] = pd.to_datetime(df['actual_delivery_time'])
-
-# Calculate delivery time in minutes
-df['delivery_time_minutes'] = (df['actual_delivery_time'] - df['created_at']).dt.total_seconds() / 60
-
-# Display the first few rows with the new column
-df[['created_at', 'actual_delivery_time', 'delivery_time_minutes']].head()
-
-# Check for nulls again, especially for the new column
-df.isnull().sum()
-# Drop rows where delivery_time_minutes is null (these are the rows where actual_delivery_time was null)
-df.dropna(subset=['delivery_time_minutes'], inplace=True)
-
-# Impute missing numerical values with the mean
-# Columns to impute: market_id, order_protocol, total_onshift_partners, total_busy_partners, total_outstanding_orders
-for col in ['market_id', 'order_protocol', 'total_onshift_partners', 'total_busy_partners', 'total_outstanding_orders']:
-    if df[col].isnull().any():
-        df[col] = df[col].fillna(df[col].mean()) # Modified to avoid FutureWarning
-
-# Impute missing categorical values for 'store_primary_category' with 'Unknown'
-df['store_primary_category'] = df['store_primary_category'].fillna('Unknown') # Modified to avoid FutureWarning
-
-# Verify that there are no more missing values
-df.isnull().sum()
-# Extract time-based features from 'created_at'
-df['hour_of_day'] = df['created_at'].dt.hour
-df['day_of_week'] = df['created_at'].dt.dayofweek
-df['month'] = df['created_at'].dt.month
-
-# Encode 'store_primary_category' using one-hot encoding
-df = pd.get_dummies(df, columns=['store_primary_category'], prefix='category')
-
-# Display the first few rows with the new features
-df[['created_at', 'hour_of_day', 'day_of_week', 'month', 'category_american', 'category_mexican']].head()
-
-# Define features (X) and target (y)
-# Drop 'created_at', 'actual_delivery_time', 'store_id' as they are not direct features or have been processed
-X = df.drop(columns=['created_at', 'actual_delivery_time', 'store_id', 'delivery_time_minutes'])
-y = df['delivery_time_minutes']
-
-# Identify numerical columns for scaling (excluding the newly created time features which are already numerical and one-hot encoded features)
-numerical_cols = ['market_id', 'order_protocol', 'total_items', 'subtotal', 'num_distinct_items',
-                  'min_item_price', 'max_item_price', 'total_onshift_partners', 'total_busy_partners', 'total_outstanding_orders']
-
-# Ensure all numerical_cols are present in X before scaling
-numerical_cols = [col for col in numerical_cols if col in X.columns]
-
-# Split data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Scale numerical features
-scaler = StandardScaler()
-X_train[numerical_cols] = scaler.fit_transform(X_train[numerical_cols])
-X_test[numerical_cols] = scaler.transform(X_test[numerical_cols])
-
-# Display the shapes of the datasets and a sample of the scaled training data
-print(f"X_train shape: {X_train.shape}")
-print(f"X_test shape: {X_test.shape}")
-print(f"y_train shape: {y_train.shape}")
-print(f"y_test shape: {y_test.shape}")
-X_train.head()
+    def forward(self, x):
+        return self.network(x)
 
 
-# Define the Neural Network model
-model = keras.Sequential([
-    layers.Dense(128, activation='relu', input_shape=(X_train.shape[1],)),
-    layers.Dropout(0.2),
-    layers.Dense(64, activation='relu'),
-    layers.Dropout(0.2),
-    layers.Dense(32, activation='relu'),
-    layers.Dense(1)  # Output layer for regression
-])
+# ==========================================
+# 2. DATA DOWNLOAD & PREPROCESSING
+# ==========================================
+def download_data():
+    zip_path = "dataset.zip"
+    csv_path = "dataset.csv"
 
-# Compile the model
-model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+    if not os.path.exists(csv_path):
+        print("📥 Downloading dataset (bypassing 403 Forbidden)...")
+        url = "https://d2beiqkhq929f0.cloudfront.net/public_assets/assets/000/015/039/original/dataset.csv.zip?1663710760"
+        
+        # Headers to prevent 403 Permission Denied
+        req = urllib.request.Request(
+            url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        )
+        
+        with urllib.request.urlopen(req) as response, open(zip_path, 'wb') as out_file:
+            out_file.write(response.read())
 
-# Display model summary
-model.summary()
+        print("📦 Extracting dataset...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(".")
+            
+    return pd.read_csv(csv_path)
 
-# Train the model
-history = model.fit(
-    X_train,
-    y_train,
-    epochs=20,  # You can adjust the number of epochs
-    batch_size=256,
-    validation_data=(X_test, y_test),
-    verbose=1
-)
+def main():
+    df = download_data()
 
-# Evaluate the model on the test data
-loss, mae = model.evaluate(X_test, y_test, verbose=0)
-print(f"Test Loss (Mean Squared Error): {loss:.2f}")
-print(f"Test Mean Absolute Error: {mae:.2f}")
+    print("🧹 Cleaning data and engineering features...")
+    df['created_at'] = pd.to_datetime(df['created_at'])
+    df['actual_delivery_time'] = pd.to_datetime(df['actual_delivery_time'])
+    
+    # Calculate target (minutes)
+    df['delivery_time_min'] = (df['actual_delivery_time'] - df['created_at']).dt.total_seconds() / 60.0
+    df = df.dropna(subset=['delivery_time_min'])
+    df = df[(df['delivery_time_min'] >= 2) & (df['delivery_time_min'] <= 180)]
 
+    # Feature Engineering
+    df['order_hour'] = df['created_at'].dt.hour
+    df['order_dayofweek'] = df['created_at'].dt.dayofweek
+    df['is_weekend'] = (df['order_dayofweek'] >= 5).astype(int)
 
+    df['busy_partner_ratio'] = df['total_busy_partners'] / (df['total_onshift_partners'] + 1e-5)
+    df['partner_load_per_order'] = df['total_outstanding_orders'] / (df['total_onshift_partners'] + 1e-5)
+    df['avg_item_price'] = df['subtotal'] / (df['total_items'] + 1e-5)
 
-model.save("porter_nn_model.h5")
-print("Training complete. Model and scaler saved successfully!")
+    num_cols = [
+        'subtotal', 'total_items', 'num_distinct_items', 'min_item_price', 'max_item_price',
+        'total_onshift_partners', 'total_busy_partners', 'total_outstanding_orders',
+        'order_hour', 'order_dayofweek', 'is_weekend', 'busy_partner_ratio', 
+        'partner_load_per_order', 'avg_item_price'
+    ]
+    cat_cols = ['market_id', 'store_primary_category', 'order_protocol']
 
-# Save the StandardScaler
-joblib.dump(scaler, 'scaler.pkl')
-print('StandardScaler saved as scaler.pkl')
+    # Imputation
+    for col in num_cols:
+        df[col] = df[col].fillna(df[col].median())
 
-# Save the feature columns (column names of X_train) for consistent preprocessing in the API
-joblib.dump(X_train.columns.tolist(), 'feature_columns.pkl')
-print('Feature columns saved as feature_columns.pkl')
+    for col in cat_cols:
+        df[col] = df[col].astype(str).fillna('Unknown')
+
+    # Remove IQR Outliers
+    q1 = df['delivery_time_min'].quantile(0.25)
+    q3 = df['delivery_time_min'].quantile(0.75)
+    iqr = q3 - q1
+    df = df[(df['delivery_time_min'] >= q1 - 1.5 * iqr) & (df['delivery_time_min'] <= q3 + 1.5 * iqr)]
+
+    # Split and scale
+    X = df[num_cols + cat_cols]
+    y = df['delivery_time_min'].values
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=SEED)
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', StandardScaler(), num_cols),
+            ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), cat_cols)
+        ]
+    )
+
+    X_train_proc = preprocessor.fit_transform(X_train)
+    X_test_proc = preprocessor.transform(X_test)
+
+    joblib.dump(preprocessor, 'preprocessor.joblib')
+    print("💾 Saved preprocessor to 'preprocessor.joblib'")
+
+    # Convert to Tensors
+    X_train_t = torch.tensor(X_train_proc, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+    X_test_t = torch.tensor(X_test_proc, dtype=torch.float32)
+
+    train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=128, shuffle=True)
+
+    input_dim = X_train_proc.shape[1]
+    model = DeliveryTimePredictor(input_dim)
+    
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+
+    print("🧠 Training PyTorch Neural Network...")
+    epochs = 30
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            loss = criterion(model(batch_x), batch_y)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * batch_x.size(0)
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"   Epoch [{epoch+1:02d}/{epochs:02d}] - Loss: {running_loss/len(train_loader.dataset):.4f}")
+
+    # Evaluation
+    model.eval()
+    with torch.no_grad():
+        preds = model(X_test_t).numpy().flatten()
+
+    mae = np.mean(np.abs(y_test - preds))
+    rmse = np.sqrt(np.mean((y_test - preds) ** 2))
+
+    print(f"\n📊 Performance - MAE: {mae:.2f} mins | RMSE: {rmse:.2f} mins")
+
+    torch.save(model.state_dict(), 'porter_nn_model.pth')
+    print("💾 Saved PyTorch weights to 'porter_nn_model.pth'")
+
+if __name__ == "__main__":
+    main()

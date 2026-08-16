@@ -1,74 +1,78 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
 import pandas as pd
 import numpy as np
-from flask import Flask, request, jsonify
-import tensorflow as tf
+import torch
+import torch.nn as nn
 import joblib
 
-app = Flask(__name__)
+class DeliveryTimePredictor(nn.Module):
+    def __init__(self, input_dim):
+        super(DeliveryTimePredictor, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+    def forward(self, x):
+        return self.network(x)
 
-# Load the trained model
-model = tf.keras.models.load_model('porter_nn_model.h5')
-feature_columns = joblib.load('feature_columns.pkl')
-# Load the scaler
-scaler = joblib.load('scaler.pkl')
+app = FastAPI(title="Porter Delivery ETA Backend")
 
-@app.route('/')
-def home():
-    return 'Delivery Time Prediction API'
+preprocessor = joblib.load('preprocessor.joblib')
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    try:
-        data = request.get_json(force=True)
+# Calculate input dimension dynamically from preprocessor
+dummy_df = pd.DataFrame([{
+    'subtotal': 1000, 'total_items': 2, 'num_distinct_items': 2, 'min_item_price': 400,
+    'max_item_price': 600, 'total_onshift_partners': 20, 'total_busy_partners': 10,
+    'total_outstanding_orders': 15, 'order_hour': 19, 'order_dayofweek': 4,
+    'is_weekend': 0, 'busy_partner_ratio': 0.5, 'partner_load_per_order': 0.75,
+    'avg_item_price': 500, 'market_id': '1.0', 'store_primary_category': 'american',
+    'order_protocol': '1.0'
+}])
+input_dim = preprocessor.transform(dummy_df).shape[1]
 
-        # Convert input data to DataFrame
-        input_df = pd.DataFrame([data])
+model = DeliveryTimePredictor(input_dim)
+model.load_state_dict(torch.load('porter_nn_model.pth'))
+model.eval()
 
-        if 'created_at' in input_df.columns:
-            input_df['created_at'] = pd.to_datetime(input_df['created_at'])
-            input_df['hour_of_day'] = input_df['created_at'].dt.hour
-            input_df['day_of_week'] = input_df['created_at'].dt.dayofweek
-            input_df['month'] = input_df['created_at'].dt.month
-            input_df = input_df.drop(columns=['created_at'])
-        else:
+class OrderRequest(BaseModel):
+    market_id: str
+    store_primary_category: str
+    order_protocol: str
+    subtotal: float
+    total_items: int
+    num_distinct_items: int
+    min_item_price: float
+    max_item_price: float
+    total_onshift_partners: float
+    total_busy_partners: float
+    total_outstanding_orders: float
+    created_at_hour: int
+    created_at_dayofweek: int
 
-            pass # Assume hour_of_day, day_of_week, month are provided or handled upstream
+@app.post("/predict")
+def predict(order: OrderRequest):
+    data = order.dict()
+    data['order_hour'] = data.pop('created_at_hour')
+    data['order_dayofweek'] = data.pop('created_at_dayofweek')
+    data['is_weekend'] = 1 if data['order_dayofweek'] >= 5 else 0
+    data['busy_partner_ratio'] = data['total_busy_partners'] / (data['total_onshift_partners'] + 1e-5)
+    data['partner_load_per_order'] = data['total_outstanding_orders'] / (data['total_onshift_partners'] + 1e-5)
+    data['avg_item_price'] = data['subtotal'] / (data['total_items'] + 1e-5)
 
-        # One-hot encode 'store_primary_category'
-        if 'store_primary_category' in input_df.columns:
-            
-            all_categories = [col.replace('category_', '') for col in feature_columns if col.startswith('category_')]
-            for cat in all_categories:
-                input_df[f'category_{cat}'] = (input_df['store_primary_category'] == cat).astype(int)
-            input_df = input_df.drop(columns=['store_primary_category'])
-        
-        
-        numerical_cols_for_inference = ['market_id', 'order_protocol', 'total_items', 'subtotal', 'num_distinct_items',
-                                  'min_item_price', 'max_item_price', 'total_onshift_partners', 'total_busy_partners', 'total_outstanding_orders']
-        for col in numerical_cols_for_inference:
-            if col not in input_df.columns:
-                input_df[col] = 0 # Or use a default/mean from training
+    processed = preprocessor.transform(pd.DataFrame([data]))
+    with torch.no_grad():
+        tensor_in = torch.tensor(processed, dtype=torch.float32)
+        prediction = model(tensor_in).item()
 
-        # Align columns with training data - this is crucial for one-hot encoded features
-        # Create a DataFrame with all expected feature columns, filled with zeros
-        processed_input = pd.DataFrame(0, index=[0], columns=feature_columns)
-        
-        # Fill in the values from the input
-        for col in input_df.columns:
-            if col in processed_input.columns:
-                processed_input[col] = input_df[col]
-
-        # Scale numerical features
-        # Assuming `numerical_cols_for_inference` covers the numerical columns that were scaled
-        processed_input[numerical_cols_for_inference] = scaler.transform(processed_input[numerical_cols_for_inference])
-
-        # Make prediction
-        prediction = model.predict(processed_input.values)
-        
-        return jsonify({'predicted_delivery_time_minutes': float(prediction[0][0])})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
-
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    return {"predicted_delivery_time_minutes": round(max(5.0, prediction), 2)}
